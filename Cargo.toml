@@ -7,7 +7,9 @@ license = "LGPL-3.0-or-later"
 authors = ["Russ Garrett <russ@garrett.co.uk>"]
 
 [dependencies]
+log = "0.4.8"
 bincode = "1.2.0"
 crc16 = "0.4.0"
 serial = "0.4.0"
 num_enum = "0.4.1"
+bitreader = "0.3.2"

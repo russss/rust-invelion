@@ -1,7 +1,13 @@
 use num_enum::TryFromPrimitive;
+use std::convert::TryFrom;
+use bitreader::BitReader;
 
-#[derive(Copy, Clone, PartialEq, Debug)]
-#[allow(dead_code)]
+use crate::error::{Error, Result};
+
+pub(crate) const START_BYTE: u8 = 0xA0;
+
+#[derive(Copy, Clone, PartialEq, Debug, TryFromPrimitive)]
+#[repr(u8)]
 pub(crate) enum CommandType {
     // Reader commands
     Reset = 0x70,
@@ -53,7 +59,7 @@ pub(crate) enum CommandType {
     GetInventoryBuffer = 0x90,
     GetAndResetInventoryBuffer = 0x91,
     GetBufferTagCount = 0x92,
-    ResetInventoryBuffer = 0x93
+    ResetInventoryBuffer = 0x93,
 }
 
 #[derive(Debug, Eq, PartialEq, TryFromPrimitive)]
@@ -101,15 +107,197 @@ pub enum ResponseCode {
     FailToAchieveDesiredPowerError = 0x54,
     CopyrightAuthenticationError = 0x55,
     SpectrumRegulationError = 0x56,
-    OutputPowerTooLowError = 0x57
+    OutputPowerTooLowError = 0x57,
 }
 
-impl ResponseCode {
+/// Whether this command includes a response type in its reply.
+///
+/// Hilariously in some cases this depends on the length of the response packet.
+fn command_has_response_code(command: CommandType, length: usize) -> bool {
+    match command {
+        CommandType::GetFirmwareVersion => false,
+        CommandType::GetOutputPower => false,
+        CommandType::GetReaderTemperature => false,
+        CommandType::RealTimeInventory => {
+            if length == 0x04 {
+                // Failed inventory
+                true
+            } else {
+                false
+            }
+        }
+        _ => true   
+    }
+}
+
+#[derive(Debug, Eq, PartialEq, TryFromPrimitive)]
+#[repr(u8)]
+pub enum FrequencyRegion {
+    FCC = 0x01,
+    ETSI = 0x02,
+    CHN = 0x03,
+    UserDefined = 0x04,
+}
+
+
+/// Convert internal representation to a frequency in MHz
+///
+/// This is derived from table 4 in the datasheet.
+fn convert_frequency(freq: u8) -> f32 {
+    if freq < 7 {
+        return 865. + 0.5 * freq as f32;
+    }
+    return 902. + 0.5 * freq as f32;
+}
+
+/// Convert internal representation to a RSSI in dBm
+///
+/// This is derived from table 5 in the datasheet.
+fn convert_rssi(rssi: u8) -> i8 {
+    // Is this discontinuity a bug? Who knows.
+    if rssi > 89 {
+        (rssi as i16 - 129) as i8
+    } else {
+        (rssi as i16 - 130) as i8
+    }
+}
+
+/// Calculate checksum digit
+///
+/// Datasheet section 6
+fn calculate_checksum(data: &[u8]) -> u8 {
+    let mut sum: u8 = 0;
+
+    for i in 0..data.len() {
+        let (newsum, _) = sum.overflowing_add(data[i]);
+        sum = newsum;
+    }
+    let (result, _) = (!sum).overflowing_add(1);
+    result
+}
+
+#[derive(PartialEq, Debug)]
+pub(crate) struct Command {
+    pub address: u8,
+    pub command: CommandType,
+    pub data: Vec<u8>,
+}
+
+impl Command {
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        // Packet length excluding start and length bytes
+        let pkt_len: usize = self.data.len() + 3;
+        let mut pkt: Vec<u8> = Vec::with_capacity(pkt_len + 2);
+        pkt.push(START_BYTE);
+        pkt.push(pkt_len as u8); // Length byte
+        pkt.push(self.address);
+        pkt.push(self.command as u8);
+        pkt.append(&mut self.data.clone());
+        pkt.push(calculate_checksum(&pkt));
+        pkt
+    }
+}
+
+#[derive(PartialEq, Debug)]
+pub(crate) struct Response {
+    pub address: u8,
+    pub command: u8,
+    pub status: Option<ResponseCode>,
+    pub data: Vec<u8>,
+}
+
+impl Response {
+    pub(crate) fn from_bytes(data: Vec<u8>) -> Result<Response> {
+        assert_eq!(data[0], START_BYTE);
+        assert_eq!(data[1] as usize, data.len() - 2);
+        let len = data.len();
+
+        let checksum = calculate_checksum(&data[0..len - 1]);
+        if data[len - 1] != checksum {
+            return Err(Error::Program(format!(
+                "Bad checksum: got {:?}, expecting {:?}",
+                data[len], checksum
+            )));
+        }
+        let command_type = CommandType::try_from(data[3])?;
+        
+        // Some responses have a response code, some don't.
+        let mut data_offset = 4;
+        let mut response_code = None;
+
+        if command_has_response_code(command_type, len) {
+            data_offset = 5;
+            response_code = Some(ResponseCode::try_from(data[4])?);
+        }
+
+        Ok(Response {
+            address: data[2],
+            command: data[3],
+            status: response_code,
+            data: data[data_offset..len - 1].to_owned(),
+        })
+    }
+
     pub(crate) fn is_success(&self) -> bool {
-        match self {
-            ResponseCode::Success => true,
+        match self.status {
+            Some(ResponseCode::Success) => true,
+            None => true,
             _ => false,
         }
     }
 }
 
+#[derive(PartialEq, Debug)]
+pub struct InventoryItem {
+    pub frequency: f32,
+    pub antenna: u8,
+    pub pc: Vec<u8>,
+    pub epc: Vec<u8>,
+    pub rssi: i8
+}
+
+impl InventoryItem {
+    pub(crate) fn from_bytes(data: &[u8]) -> Result<InventoryItem> {
+        let first_byte = [data[0]];
+        let mut reader = BitReader::new(&first_byte);
+        let len = data.len();
+        Ok(InventoryItem{
+            frequency: convert_frequency(reader.read_u8(6)?),
+            antenna: reader.read_u8(2)?,
+            pc: data[1..3].to_owned(),
+            epc: data[3..len-2].to_owned(),
+            rssi: convert_rssi(data[len-1])
+        })
+    }
+}
+
+
+#[derive(PartialEq, Debug)]
+pub struct InventoryResult {
+    pub items: Vec<InventoryItem>,
+    pub antenna: u8,
+    pub read_rate: u16,
+    pub total_read: u32,
+}
+
+impl InventoryResult {
+    pub(crate) fn from_bytes(data: &[u8], items: Vec<InventoryItem>) -> Result<InventoryResult> {
+        let mut reader = BitReader::new(data);
+        Ok(InventoryResult{
+            items: items,
+            antenna: reader.read_u8(8)?,
+            read_rate: reader.read_u16(16)?,
+            total_read: reader.read_u32(32)?
+        })
+    }
+}
+
+#[test]
+fn test_checksum() {
+    // Test vectors generated using example C code from datasheet
+    assert_eq!(calculate_checksum(&[1, 2, 3, 4]), 246);
+    assert_eq!(calculate_checksum(&[134, 200, 3, 253]), 178);
+    assert_eq!(calculate_checksum(&[220, 4, 3, 30]), 255);
+    assert_eq!(calculate_checksum(&[20, 45, 3, 30, 150, 230, 120]), 170);
+    assert_eq!(calculate_checksum(&[0xA0, 0x03, 0x01, 0x72]), 0xEA);
+}

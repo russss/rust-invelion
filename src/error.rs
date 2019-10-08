@@ -1,6 +1,6 @@
 ///! Error types
 use std::io;
-use crate::ResponseCode;
+use crate::protocol::{ResponseCode, CommandType};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -28,22 +28,27 @@ impl From<String> for Error {
     }
 }
 
+impl From<bitreader::BitReaderError> for Error {
+    fn from(e: bitreader::BitReaderError) -> Error {
+        Error::Program(format!("Bitwise parsing error: {:?}", e))
+    }
+}
+
+impl From<num_enum::TryFromPrimitiveError<ResponseCode>> for Error {
+    fn from(e: num_enum::TryFromPrimitiveError<ResponseCode>) -> Error {
+        Error::Program(format!("Error parsing response code: {:?}", e))
+    }
+}
+
+impl From<num_enum::TryFromPrimitiveError<CommandType>> for Error {
+    fn from(e: num_enum::TryFromPrimitiveError<CommandType>) -> Error {
+        Error::Program(format!("Error parsing command type: {:?}", e))
+    }
+}
+
 impl From<ResponseCode> for Error {
     fn from(e: ResponseCode) -> Error {
         match e {
-            /*
-            ResponseStatus::PoorCommunication => Error::Communication(e),
-            ResponseStatus::NoTags => Error::Communication(e),
-
-            ResponseStatus::AccessPasswordError => Error::Protocol(e),
-            ResponseStatus::KillTagError => Error::Protocol(e),
-            ResponseStatus::KillPasswordZero => Error::Protocol(e),
-            ResponseStatus::CommandNotSupported => Error::Protocol(e),
-
-            ResponseStatus::WrongLength => Error::Program("Wrong command length".to_string()),
-            ResponseStatus::IllegalCommand => Error::Program("Illegal command".to_string()),
-            ResponseStatus::ParameterError => Error::Program("Parameter error".to_string()),
-*/
             other => Error::Program(format!("Invalid status response: {:?}", other))
         }
     }
