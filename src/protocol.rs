@@ -65,7 +65,7 @@ pub(crate) enum CommandType {
 #[derive(Debug, Eq, PartialEq, TryFromPrimitive)]
 #[repr(u8)]
 pub enum ResponseCode {
-    Success = 0x00,
+    Success = 0x10,
     Fail = 0x11,
 
     MCUResetError = 0x20,
@@ -118,6 +118,9 @@ fn command_has_response_code(command: CommandType, length: usize) -> bool {
         CommandType::GetFirmwareVersion => false,
         CommandType::GetOutputPower => false,
         CommandType::GetReaderTemperature => false,
+        CommandType::GetRFPortReturnLoss => false,
+        CommandType::GetWorkAntenna => false,
+        CommandType::GetAntConnectionDetector => false,
         CommandType::RealTimeInventory => {
             if length == 0x04 {
                 // Failed inventory
@@ -130,6 +133,8 @@ fn command_has_response_code(command: CommandType, length: usize) -> bool {
     }
 }
 
+
+/// Enum of frequency regions
 #[derive(Debug, Eq, PartialEq, TryFromPrimitive)]
 #[repr(u8)]
 pub enum FrequencyRegion {
@@ -143,11 +148,23 @@ pub enum FrequencyRegion {
 /// Convert internal representation to a frequency in MHz
 ///
 /// This is derived from table 4 in the datasheet.
-fn convert_frequency(freq: u8) -> f32 {
+fn convert_to_frequency(freq: u8) -> f32 {
     if freq < 7 {
         return 865. + 0.5 * freq as f32;
     }
-    return 902. + 0.5 * freq as f32;
+    return 902. + 0.5 * (freq - 7) as f32;
+}
+
+/// Convert a frequency in MHz to the internal representation
+///
+/// This is derived from table 4 in the datasheet.
+pub(crate) fn convert_from_frequency(frequency: f32) -> Result<u8> {
+    if frequency >= 865. && frequency <= 868. {
+        return Ok(((frequency - 865.) / 0.5) as u8);
+    } else if frequency >= 902. && frequency <= 928. {
+        return Ok(((frequency - 902.) / 0.5) as u8 + 7);
+    }
+    Err(Error::Program(format!("Invalid frequency {}", frequency)))
 }
 
 /// Convert internal representation to a RSSI in dBm
@@ -230,29 +247,35 @@ impl Response {
             response_code = Some(ResponseCode::try_from(data[4])?);
         }
 
-        Ok(Response {
+        Response {
             address: data[2],
             command: data[3],
             status: response_code,
             data: data[data_offset..len - 1].to_owned(),
-        })
+        }.raise_error()
     }
 
-    pub(crate) fn is_success(&self) -> bool {
+    fn raise_error(self) -> Result<Response> {
         match self.status {
-            Some(ResponseCode::Success) => true,
-            None => true,
-            _ => false,
+            Some(ResponseCode::Success) => Ok(self),
+            None => Ok(self),
+            Some(status) => Err(Error::from(status)),
         }
     }
 }
 
+/// Tag EPC and metadata
 #[derive(PartialEq, Debug)]
 pub struct InventoryItem {
+    /// Frequency tag was read on
     pub frequency: f32,
+    /// Antenna tag was read on
     pub antenna: u8,
+    /// Program Control bits
     pub pc: Vec<u8>,
+    /// EPC (Tag ID)
     pub epc: Vec<u8>,
+    /// Relative Signal Strength Indicator (dBm, notionally)
     pub rssi: i8
 }
 
@@ -262,7 +285,7 @@ impl InventoryItem {
         let mut reader = BitReader::new(&first_byte);
         let len = data.len();
         Ok(InventoryItem{
-            frequency: convert_frequency(reader.read_u8(6)?),
+            frequency: convert_to_frequency(reader.read_u8(6)?),
             antenna: reader.read_u8(2)?,
             pc: data[1..3].to_owned(),
             epc: data[3..len-2].to_owned(),
@@ -272,11 +295,16 @@ impl InventoryItem {
 }
 
 
+/// The result of a successful inventory operation
 #[derive(PartialEq, Debug)]
 pub struct InventoryResult {
+    /// List of tags scanned
     pub items: Vec<InventoryItem>,
+    /// Antenna used
     pub antenna: u8,
+    /// Read rate (tags/second)
     pub read_rate: u16,
+    /// Total number of tags read
     pub total_read: u32,
 }
 
@@ -300,4 +328,22 @@ fn test_checksum() {
     assert_eq!(calculate_checksum(&[220, 4, 3, 30]), 255);
     assert_eq!(calculate_checksum(&[20, 45, 3, 30, 150, 230, 120]), 170);
     assert_eq!(calculate_checksum(&[0xA0, 0x03, 0x01, 0x72]), 0xEA);
+}
+
+#[test]
+fn test_convert_to_frequency() {
+    assert_eq!(convert_to_frequency(5), 867.5);
+    assert_eq!(convert_to_frequency(7), 902.0);
+    assert_eq!(convert_to_frequency(14), 905.5);
+    assert_eq!(convert_to_frequency(22), 909.5);
+    assert_eq!(convert_to_frequency(48), 922.5);
+    assert_eq!(convert_to_frequency(59), 928.0);
+}
+
+#[test]
+fn test_convert_from_frequency() {
+    assert_eq!(convert_from_frequency(867.5).unwrap(), 5);
+    assert_eq!(convert_from_frequency(909.5).unwrap(), 22);
+    assert_eq!(convert_from_frequency(922.5).unwrap(), 48);
+    assert_eq!(convert_from_frequency(928.0).unwrap(), 59);
 }
