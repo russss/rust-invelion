@@ -288,7 +288,7 @@ impl InventoryItem {
             frequency: convert_to_frequency(reader.read_u8(6)?),
             antenna: reader.read_u8(2)?,
             pc: data[1..3].to_owned(),
-            epc: data[3..len-2].to_owned(),
+            epc: data[3..len-1].to_owned(),
             rssi: convert_rssi(data[len-1])
         })
     }
