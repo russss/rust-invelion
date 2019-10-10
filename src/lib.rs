@@ -49,7 +49,7 @@ use std::io::Read;
 use std::iter;
 use std::time::Duration;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::protocol::{
     convert_from_frequency, Command, CommandType, InventoryItem,
     InventoryResult, Response, START_BYTE,
@@ -93,24 +93,34 @@ impl Reader {
     /// Send a command to the reader
     fn send(&mut self, cmd: Command) -> Result<()> {
         let cmd_bytes = cmd.to_bytes();
-        debug!("Send: {:?}", cmd_bytes);
+        debug!("Send {:?}: {:?}", cmd.command, cmd_bytes);
         std::io::Write::write(&mut self.port, &cmd_bytes)?;
         Ok(())
     }
 
+    /// Wait for a start byte, discarding any other bytes received.
+    ///
+    /// I've observed occasional desyncs where the read of the full packet times out, but remaining
+    /// bytes from that packet are returned on the next read. This may be due to shoddy counterfeit
+    /// USB-Serial cables.
+    fn wait_for_start(&mut self) -> Result<u8> {
+        let mut start = [0u8; 1];
+        loop {
+            std::io::Read::read_exact(&mut self.port, &mut start)?;
+            if start[0] == START_BYTE {
+                return Ok(start[0]);
+            }
+        }
+    }
+
     /// Receive a response from the reader
     fn receive(&mut self) -> Result<Response> {
-        let mut header = [0u8; 2];
-        std::io::Read::read_exact(&mut self.port, &mut header)?;
-        if header[0] != START_BYTE {
-            return Err(Error::Program(format!(
-                "Invalid header byte {:?}",
-                header[0]
-            )));
-        }
-        let len = header[1] as usize;
+        let start = self.wait_for_start()?;
+        let mut len = [0u8; 1];
+        std::io::Read::read_exact(&mut self.port, &mut len)?;
+        let len = len[0] as usize;
         let mut response: Vec<u8> = Vec::with_capacity(len + 2);
-        response.extend(&header);
+        response.extend(&[start, len as u8]);
         {
             let reference = self.port.by_ref();
             reference.take(len as u64).read_to_end(&mut response)?;
