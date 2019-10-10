@@ -1,18 +1,19 @@
 ///! Error types
 use std::io;
+use failure::Fail;
 use crate::protocol::{ResponseCode, CommandType};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug)]
+#[derive(Debug, Fail)]
 pub enum Error {
-    /// Error communicating with the reader
-    Io(io::Error),
-    /// Error communicating with the tag - usually transient and may be retried
+    #[fail(display="Reader I/O error")]
+    Io(#[fail(cause)] io::Error),
+    #[fail(display="Transient error communicating with tag: {:?}", _0)]
     Communication(ResponseCode),
-    /// Error returned from the tag
+    #[fail(display="Error returned from tag: {:?}", _0)]
     Protocol(ResponseCode),
-    /// Incorrect parameters, or internal library error
+    #[fail(display="Program error: {}", _0)]
     Program(String),
 }
 

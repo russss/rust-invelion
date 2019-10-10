@@ -39,6 +39,7 @@ extern crate bitreader;
 extern crate log;
 extern crate num_enum;
 extern crate serial;
+extern crate failure;
 
 pub mod error;
 pub mod protocol;
@@ -99,6 +100,10 @@ impl Reader {
     }
 
     /// Wait for a start byte, discarding any other bytes received.
+    ///
+    /// This allows the driver to recover from unexpected timeouts - the timeout error still needs
+    /// to be caught by the calling application and retried, but the driver object is still usable
+    /// after the error.
     ///
     /// I've observed occasional desyncs where the read of the full packet times out, but remaining
     /// bytes from that packet are returned on the next read. This may be due to shoddy counterfeit
