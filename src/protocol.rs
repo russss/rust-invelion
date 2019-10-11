@@ -1,6 +1,6 @@
+use bitreader::BitReader;
 use num_enum::TryFromPrimitive;
 use std::convert::TryFrom;
-use bitreader::BitReader;
 
 use crate::error::{Error, Result};
 
@@ -115,13 +115,13 @@ pub enum ResponseCode {
 /// Hilariously in some cases this depends on the length of the response packet.
 fn command_has_response_code(command: CommandType, length: usize) -> bool {
     match command {
-        CommandType::GetFirmwareVersion => false,
-        CommandType::GetOutputPower => false,
-        CommandType::GetReaderTemperature => false,
-        CommandType::GetRFPortReturnLoss => false,
-        CommandType::GetWorkAntenna => false,
-        CommandType::GetAntConnectionDetector => false,
-        CommandType::RealTimeInventory => {
+        CommandType::GetFirmwareVersion
+        | CommandType::GetOutputPower
+        | CommandType::GetReaderTemperature
+        | CommandType::GetRFPortReturnLoss
+        | CommandType::GetWorkAntenna
+        | CommandType::GetAntConnectionDetector => false,
+        CommandType::RealTimeInventory | CommandType::Read | CommandType::SetAccessEPCMatch => {
             if length == 0x04 {
                 // Failed inventory
                 true
@@ -129,10 +129,9 @@ fn command_has_response_code(command: CommandType, length: usize) -> bool {
                 false
             }
         }
-        _ => true   
+        _ => true,
     }
 }
-
 
 /// Enum of frequency regions
 #[derive(Debug, Eq, PartialEq, TryFromPrimitive)]
@@ -144,6 +143,15 @@ pub enum FrequencyRegion {
     UserDefined = 0x04,
 }
 
+/// Enum of memory banks
+#[derive(Debug, Eq, PartialEq, TryFromPrimitive)]
+#[repr(u8)]
+pub enum MemoryBank {
+    Reserved = 0x00,
+    EPC = 0x01,
+    TID = 0x02,
+    User = 0x03,
+}
 
 /// Convert internal representation to a frequency in MHz
 ///
@@ -218,13 +226,13 @@ impl Command {
 #[derive(PartialEq, Debug)]
 pub(crate) struct Response {
     pub address: u8,
-    pub command: u8,
+    pub command: CommandType,
     pub status: Option<ResponseCode>,
     pub data: Vec<u8>,
 }
 
 impl Response {
-    pub(crate) fn from_bytes(data: Vec<u8>) -> Result<Response> {
+    pub(crate) fn from_bytes(data: &[u8]) -> Result<Response> {
         assert_eq!(data[0], START_BYTE);
         assert_eq!(data[1] as usize, data.len() - 2);
         let len = data.len();
@@ -237,27 +245,29 @@ impl Response {
             )));
         }
         let command_type = CommandType::try_from(data[3])?;
-        
+
         // Some responses have a response code, some don't.
         let mut data_offset = 4;
         let mut response_code = None;
 
-        if command_has_response_code(command_type, len) {
+        if command_has_response_code(command_type, len - 2) {
             data_offset = 5;
             response_code = Some(ResponseCode::try_from(data[4])?);
         }
 
         Response {
             address: data[2],
-            command: data[3],
+            command: command_type,
             status: response_code,
             data: data[data_offset..len - 1].to_owned(),
-        }.raise_error()
+        }
+        .raise_error()
     }
 
     fn raise_error(self) -> Result<Response> {
         match self.status {
             Some(ResponseCode::Success) => Ok(self),
+            Some(ResponseCode::NoTagError) => Ok(self),
             None => Ok(self),
             Some(status) => Err(Error::from(status)),
         }
@@ -276,7 +286,7 @@ pub struct InventoryItem {
     /// EPC (Tag ID)
     pub epc: Vec<u8>,
     /// Relative Signal Strength Indicator (dBm, notionally)
-    pub rssi: i8
+    pub rssi: i8,
 }
 
 impl InventoryItem {
@@ -284,16 +294,15 @@ impl InventoryItem {
         let first_byte = [data[0]];
         let mut reader = BitReader::new(&first_byte);
         let len = data.len();
-        Ok(InventoryItem{
+        Ok(InventoryItem {
             frequency: convert_to_frequency(reader.read_u8(6)?),
             antenna: reader.read_u8(2)?,
             pc: data[1..3].to_owned(),
-            epc: data[3..len-1].to_owned(),
-            rssi: convert_rssi(data[len-1])
+            epc: data[3..len - 1].to_owned(),
+            rssi: convert_rssi(data[len - 1]),
         })
     }
 }
-
 
 /// The result of a successful inventory operation
 #[derive(PartialEq, Debug)]
@@ -311,12 +320,53 @@ pub struct InventoryResult {
 impl InventoryResult {
     pub(crate) fn from_bytes(data: &[u8], items: Vec<InventoryItem>) -> Result<InventoryResult> {
         let mut reader = BitReader::new(data);
-        Ok(InventoryResult{
+        Ok(InventoryResult {
             items: items,
             antenna: reader.read_u8(8)?,
             read_rate: reader.read_u16(16)?,
-            total_read: reader.read_u32(32)?
+            total_read: reader.read_u32(32)?,
         })
+    }
+}
+
+/// The result of a successful read operation
+#[derive(PartialEq, Debug)]
+pub struct ReadResult {
+    pub epc: Vec<u8>,
+    pub data: Vec<u8>,
+    pub frequency: f32,
+    pub antenna: u8,
+    pub read_count: u8,
+}
+
+impl ReadResult {
+    pub(crate) fn from_bytes(packet: &[u8]) -> Result<(usize, ReadResult)> {
+        let mut reader = BitReader::new(packet);
+        let tag_count = reader.read_u16(16)?;
+        let data_len = reader.read_u8(8)? as usize;
+        let mut data = Vec::new();
+        for _i in 0..data_len {
+            data.push(reader.read_u8(8)?);
+        }
+
+        // The data here is 2 bytes PC, (data_len - read_len - 4) bytes EPC, 2 bytes checksum,
+        // read_len bytes data.
+
+        let read_len = reader.read_u8(8)? as usize;
+        let frequency = convert_to_frequency(reader.read_u8(6)?);
+        let antenna = reader.read_u8(2)?;
+        let read_count = reader.read_u8(8)?;
+
+        Ok((
+            tag_count as usize,
+            ReadResult {
+                epc: data[2..(data_len - read_len - 2)].to_vec(),
+                data: data[(data_len - read_len)..data_len].to_vec(),
+                frequency: frequency,
+                antenna: antenna,
+                read_count: read_count,
+            },
+        ))
     }
 }
 
@@ -346,4 +396,16 @@ fn test_convert_from_frequency() {
     assert_eq!(convert_from_frequency(909.5).unwrap(), 22);
     assert_eq!(convert_from_frequency(922.5).unwrap(), 48);
     assert_eq!(convert_from_frequency(928.0).unwrap(), 59);
+}
+
+#[test]
+fn test_read() {
+    let data = [
+        160, 33, 1, 129, 0, 1, 24, 48, 0, 48, 57, 96, 98, 195, 149, 13, 64, 0, 17, 184, 151, 205,
+        11, 226, 128, 104, 144, 32, 0, 80, 1, 8, 11, 1, 141,
+    ];
+    let res = Response::from_bytes(&data).unwrap();
+    println!("{:?}", res);
+    let result = ReadResult::from_bytes(&res.data);
+    println!("{:?}", result);
 }

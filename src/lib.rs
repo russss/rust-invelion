@@ -1,5 +1,5 @@
 //! This driver provides Rust support for a number of Chinese-manufactured UHF RFID
-//! Gen2 reader modules based on the Impinj Indy R2000 RF chipset with an AVR ARM processor. 
+//! Gen2 reader modules based on the Impinj Indy R2000 RF chipset with an AVR ARM processor.
 //!
 //! It appears that these readers are based on a white-label module design which is used by a
 //! number of Chinese manufacturers. The original designer remains unknown. I've named this module
@@ -36,15 +36,15 @@
 //!
 
 extern crate bitreader;
+extern crate failure;
 extern crate log;
 extern crate num_enum;
 extern crate serial;
-extern crate failure;
 
 pub mod error;
 pub mod protocol;
 
-use log::debug;
+use log::{debug, warn};
 use serial::core::prelude::*;
 use std::io::Read;
 use std::iter;
@@ -52,10 +52,15 @@ use std::time::Duration;
 
 use crate::error::Result;
 use crate::protocol::{
-    convert_from_frequency, Command, CommandType, InventoryItem,
-    InventoryResult, Response, START_BYTE,
+    convert_from_frequency, Command, CommandType, InventoryItem, InventoryResult, MemoryBank,
+    ReadResult, Response, START_BYTE, ResponseCode
 };
 
+// Some operations can be quite slow, especially with a lot of tags around.
+// I've definitely seen operations take longer than 1sec to complete.
+const READ_TIMEOUT: Duration = Duration::from_millis(5000);
+
+/// Invelion reader
 pub struct Reader {
     port: serial::SystemPort,
     antenna_count: usize,
@@ -63,7 +68,6 @@ pub struct Reader {
 }
 
 impl Reader {
-
     /// Create the object and connect to the serial port
     ///
     /// `port` should be the name of a serial port device.
@@ -82,7 +86,7 @@ impl Reader {
         })
         .map_err(|e| format!("Failed to configure serial port: {}", e))?;
 
-        port.set_timeout(Duration::from_millis(1000))
+        port.set_timeout(READ_TIMEOUT)
             .map_err(|e| format!("Failed to set serial port timeout: {}", e))?;
         Ok(Reader {
             port: port,
@@ -102,7 +106,7 @@ impl Reader {
     /// Wait for a start byte, discarding any other bytes received.
     ///
     /// This allows the driver to recover from unexpected timeouts - the timeout error still needs
-    /// to be caught by the calling application and retried, but the driver object is still usable
+    /// to be caught by the calling application and retried, but the driver object is usable
     /// after the error.
     ///
     /// I've observed occasional desyncs where the read of the full packet times out, but remaining
@@ -118,8 +122,7 @@ impl Reader {
         }
     }
 
-    /// Receive a response from the reader
-    fn receive(&mut self) -> Result<Response> {
+    fn receive_packet(&mut self) -> Result<Response> {
         let start = self.wait_for_start()?;
         let mut len = [0u8; 1];
         std::io::Read::read_exact(&mut self.port, &mut len)?;
@@ -131,12 +134,28 @@ impl Reader {
             reference.take(len as u64).read_to_end(&mut response)?;
         }
         debug!("Receive: {:?}", response);
-        Ok(Response::from_bytes(response)?)
+        Ok(Response::from_bytes(&response)?)
+    }
+
+    /// Receive a response from the reader
+    ///
+    /// This will drop packets which don't have the expected command type in case the driver has
+    /// lost sync.
+    fn receive(&mut self, command_type: CommandType) -> Result<Response> {
+        loop {
+            let packet = self.receive_packet()?;
+            if packet.command == command_type {
+                return Ok(packet);
+            } else {
+                warn!("Dropped packet due to incorrect command type: {:?}", packet);
+            }
+        }
     }
 
     fn exchange(&mut self, command: Command) -> Result<Response> {
+        let command_type = command.command;
         self.send(command)?;
-        self.receive()
+        self.receive(command_type)
     }
 
     /// Send a command with no parameters and receive a response
@@ -189,7 +208,7 @@ impl Reader {
     /// The value is the detector threshold in dB, or 0 if disabled.
     pub fn get_antenna_connection_detector(&mut self) -> Result<i8> {
         let response = self.exchange_simple(CommandType::GetAntConnectionDetector)?;
-	Ok(-(response.data[0] as i8))
+        Ok(-(response.data[0] as i8))
     }
 
     /// Set the output power per antenna and save to flash
@@ -260,11 +279,76 @@ impl Reader {
 
         let mut tags: Vec<InventoryItem> = Vec::new();
         loop {
-            let response = self.receive()?;
+            let response = self.receive(CommandType::RealTimeInventory)?;
             if response.data.len() < 8 {
                 return InventoryResult::from_bytes(&response.data, tags);
             };
             tags.push(InventoryItem::from_bytes(&response.data)?);
         }
+    }
+
+    /// Read data from tags
+    ///
+    /// By default this will issue a read command to all tags within range. It will return a
+    /// ReadResult for each tag it successfully read - this may include duplicate EPCs if those
+    /// tags have different data.
+    ///
+    /// # Arguments
+    ///
+    /// * `bank` - the memory bank to read from.
+    /// * `password` - the 4-byte password, or `[0, 0, 0, 0]` if not set/required.
+    /// * `start` - the starting offset of the read, in 2-byte words.
+    /// * `length` - the number of 2-byte words to read.
+    pub fn read(
+        &mut self,
+        bank: MemoryBank,
+        password: &[u8],
+        start: u8,
+        length: u8,
+    ) -> Result<Vec<ReadResult>> {
+        let mut data = vec![bank as u8, start, length];
+        data.extend(password);
+        let cmd = Command {
+            address: self.address,
+            command: CommandType::Read,
+            data: data,
+        };
+        self.send(cmd)?;
+
+        let mut results = Vec::new();
+        loop {
+            let response = self.receive(CommandType::Read)?;
+            if response.status == Some(ResponseCode::NoTagError) {
+                // No tags found
+                return Ok(results);
+            }
+            let (tag_count, packet) = ReadResult::from_bytes(&response.data)?;
+            results.push(packet);
+            if results.len() == tag_count {
+                return Ok(results);
+            }
+        }
+    }
+
+    /// (NOT working) set EPC access match mask
+    ///
+    /// I assume this function restricts commands to act on certain EPC tags but I can't get it to
+    /// work.
+    pub fn set_epc_match(&mut self, epc: &[u8]) -> Result<()> {
+        let mut mode = 0x00;
+        if epc.len() == 0 {
+            mode = 0x01; // Clear match
+        }
+
+        let mut data = vec![mode, epc.len() as u8];
+        data.extend(epc);
+
+        let cmd = Command {
+            address: self.address,
+            command: CommandType::SetAccessEPCMatch,
+            data: data,
+        };
+        self.exchange(cmd)?;
+        Ok(())
     }
 }
