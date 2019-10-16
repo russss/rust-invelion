@@ -122,12 +122,7 @@ fn command_has_response_code(command: CommandType, length: usize) -> bool {
         | CommandType::GetWorkAntenna
         | CommandType::GetAntConnectionDetector => false,
         CommandType::RealTimeInventory | CommandType::Read | CommandType::SetAccessEPCMatch => {
-            if length == 0x04 {
-                // Failed inventory
-                true
-            } else {
-                false
-            }
+            length == 0x04
         }
         _ => true,
     }
@@ -158,9 +153,10 @@ pub enum MemoryBank {
 /// This is derived from table 4 in the datasheet.
 fn convert_to_frequency(freq: u8) -> f32 {
     if freq < 7 {
-        return 865. + 0.5 * freq as f32;
+        865. + 0.5 * f32::from(freq)
+    } else {
+        902. + 0.5 * f32::from(freq - 7)
     }
-    return 902. + 0.5 * (freq - 7) as f32;
 }
 
 /// Convert a frequency in MHz to the internal representation
@@ -181,9 +177,9 @@ pub(crate) fn convert_from_frequency(frequency: f32) -> Result<u8> {
 fn convert_rssi(rssi: u8) -> i8 {
     // Is this discontinuity a bug? Who knows.
     if rssi > 89 {
-        (rssi as i16 - 129) as i8
+        (i16::from(rssi) - 129) as i8
     } else {
-        (rssi as i16 - 130) as i8
+        (i16::from(rssi) - 130) as i8
     }
 }
 
@@ -193,8 +189,8 @@ fn convert_rssi(rssi: u8) -> i8 {
 fn calculate_checksum(data: &[u8]) -> u8 {
     let mut sum: u8 = 0;
 
-    for i in 0..data.len() {
-        let (newsum, _) = sum.overflowing_add(data[i]);
+    for byte in data {
+        let (newsum, _) = sum.overflowing_add(*byte);
         sum = newsum;
     }
     let (result, _) = (!sum).overflowing_add(1);
@@ -247,13 +243,16 @@ impl Response {
         let command_type = CommandType::try_from(data[3])?;
 
         // Some responses have a response code, some don't.
-        let mut data_offset = 4;
-        let mut response_code = None;
+        let response_code = if command_has_response_code(command_type, len - 2) {
+            Some(ResponseCode::try_from(data[4])?)
+        } else {
+            None   
+        };
 
-        if command_has_response_code(command_type, len - 2) {
-            data_offset = 5;
-            response_code = Some(ResponseCode::try_from(data[4])?);
-        }
+        let data_offset = match response_code {
+            Some(_) => 5,
+            None => 4
+        };
 
         Response {
             address: data[2],
@@ -321,7 +320,7 @@ impl InventoryResult {
     pub(crate) fn from_bytes(data: &[u8], items: Vec<InventoryItem>) -> Result<InventoryResult> {
         let mut reader = BitReader::new(data);
         Ok(InventoryResult {
-            items: items,
+            items,
             antenna: reader.read_u8(8)?,
             read_rate: reader.read_u16(16)?,
             total_read: reader.read_u32(32)?,
@@ -362,9 +361,9 @@ impl ReadResult {
             ReadResult {
                 epc: data[2..(data_len - read_len - 2)].to_vec(),
                 data: data[(data_len - read_len)..data_len].to_vec(),
-                frequency: frequency,
-                antenna: antenna,
-                read_count: read_count,
+                frequency,
+                antenna,
+                read_count,
             },
         ))
     }

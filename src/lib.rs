@@ -89,8 +89,8 @@ impl Reader {
         port.set_timeout(READ_TIMEOUT)
             .map_err(|e| format!("Failed to set serial port timeout: {}", e))?;
         Ok(Reader {
-            port: port,
-            address: address,
+            port,
+            address,
             antenna_count: antenna_count as usize,
         })
     }
@@ -162,7 +162,7 @@ impl Reader {
     fn exchange_simple(&mut self, command: CommandType) -> Result<Response> {
         let cmd = Command {
             address: self.address,
-            command: command,
+            command,
             data: vec![],
         };
         self.exchange(cmd)
@@ -311,7 +311,7 @@ impl Reader {
         let cmd = Command {
             address: self.address,
             command: CommandType::Read,
-            data: data,
+            data,
         };
         self.send(cmd)?;
 
@@ -335,10 +335,11 @@ impl Reader {
     /// I assume this function restricts commands to act on certain EPC tags but I can't get it to
     /// work.
     pub fn set_epc_match(&mut self, epc: &[u8]) -> Result<()> {
-        let mut mode = 0x00;
-        if epc.len() == 0 {
-            mode = 0x01; // Clear match
-        }
+        let mode = if epc.is_empty() {
+            0x01 // Clear match
+        } else {
+            0x00
+        };
 
         let mut data = vec![mode, epc.len() as u8];
         data.extend(epc);
@@ -346,7 +347,7 @@ impl Reader {
         let cmd = Command {
             address: self.address,
             command: CommandType::SetAccessEPCMatch,
-            data: data,
+            data,
         };
         self.exchange(cmd)?;
         Ok(())
