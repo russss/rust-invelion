@@ -1,7 +1,7 @@
 [package]
 name = "invelion"
 description = "Driver for a number of Chinese UHF RFID Gen2 modules"
-version = "0.1.2"
+version = "0.1.3"
 readme = "README.md"
 homepage = "https://github.com/russss/rust-invelion"
 repository = "https://github.com/russss/rust-invelion"
