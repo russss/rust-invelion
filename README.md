@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> This repository has been migrated to Codeberg: [https://codeberg.org/russss/rust-invelion](https://codeberg.org/russss/rust-invelion)
+
 # invelion
 
 This driver provides Rust support for a number of Chinese-manufactured UHF RFID
